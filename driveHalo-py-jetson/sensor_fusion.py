@@ -65,6 +65,10 @@ class SensorFusion:
         self.imu_weight = 0.6
         self.lane_weight = 0.4
 
+        # Add GPS state to fusion
+        self.gps_position = None
+        self.gps_route = []
+
         self.logger.info("Sensor fusion initialized")
 
     def _state_transition_fn(self, x, dt):
@@ -295,3 +299,27 @@ class SensorFusion:
         steering = max(min(steering, max_steering), -max_steering)
 
         return heading, position_y, lane_curvature
+
+    def update_from_gps(self, gps_data: dict):
+        """Update state using GPS data"""
+        with self.lock:
+            if not gps_data:
+                return
+                
+            self.gps_position = gps_data.get("position")
+            self.gps_route = gps_data.get("route", [])
+            
+            # Update state estimation with GPS data
+            if self.gps_position:
+                # Create measurement vector including GPS position
+                z = np.array([
+                    self.gps_position[0],  # latitude
+                    self.gps_position[1],  # longitude
+                    self.ukf.x[2],  # Keep existing velocity x
+                    self.ukf.x[3],  # Keep existing velocity y
+                    self.ukf.x[4]   # Keep existing heading
+                ])
+                
+                # Update UKF with GPS measurement
+                self.ukf.predict()
+                self.ukf.update(z)

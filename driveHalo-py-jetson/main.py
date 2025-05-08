@@ -25,6 +25,7 @@ from scipy.spatial.transform import Rotation
 import traceback
 from root_logger import initialize_logging, get_logger, get_control_logger, get_diagnostic_logger, LogWindow
 from diagnostic_logger import DiagnosticLogger
+from gps_path_planning import GPSPathPlanner
 
 def configure_camera(source=0, width=640, height=480, fps=10):
     """Configure camera with explicit format selection for optimal performance on Tegra"""
@@ -353,6 +354,7 @@ class MultiSensorAutonomousSystem:
             "5: Toggle performance diagnostics",
             "f: Force log all diagnostics",
             "r: Restart sensor systems",
+            "g: Toggle GPS diagnostics",
         ]
         self.show_help = False
 
@@ -393,6 +395,13 @@ class MultiSensorAutonomousSystem:
             self.should_run = True
             self.imu_thread = None
             self.fusion_thread = None
+
+            # Initialize GPS path planner
+            self.gps_planner = GPSPathPlanner(use_mock=True)  # Set to False for real GPS
+            self.gps_planner.set_diagnostic_logger(self.diagnostic_logger)
+            
+            # Add GPS buffer
+            self.gps_data_buffer = collections.deque(maxlen=100)
 
             self.logger.info("Multi-sensor autonomous system initialized successfully")
         except Exception as e:
@@ -680,6 +689,23 @@ class MultiSensorAutonomousSystem:
 
         self.logger.info("Sensor threads stopped")
 
+    def _process_gps_data(self):
+        """Process GPS data and update fusion"""
+        try:
+            gps_data = self.gps_planner.update()
+            if gps_data:
+                timestamp = time.time()
+                self.gps_data_buffer.append((timestamp, gps_data))
+                
+                # Update sensor fusion
+                self.sensor_fusion.update_from_gps(gps_data)
+                
+                # Update vehicle state
+                self.vehicle_state.update_from_gps(gps_data)
+                
+        except Exception as e:
+            self.logger.error(f"GPS processing error: {e}")
+    
     async def run(self, source=0, width=640, height=480, fps=10):
         """Main control loop with integrated sensor fusion"""
         self.logger.info(f"Opening video source: {source}")
@@ -728,6 +754,9 @@ class MultiSensorAutonomousSystem:
             last_fps_log_time = start_time
 
             while cap.isOpened():
+                # Process GPS data every iteration
+                self._process_gps_data()
+                
                 success, frame = cap.read()
                 if not success:
                     self.logger.error("Failed to read frame")
@@ -824,6 +853,9 @@ class MultiSensorAutonomousSystem:
                         self.stop_sensor_threads()
                         await asyncio.sleep(0.5)
                         self.start_sensor_threads()
+                    elif key == ord('g'):
+                        self.diagnostic_logger.toggle_category("gps")
+                        self.logger.info("Toggled GPS diagnostics")
 
                 # Add a small yield to prevent CPU overutilization
                 await asyncio.sleep(0.001)

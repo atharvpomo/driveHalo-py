@@ -1,0 +1,214 @@
+import serial
+import time
+import requests
+import random
+from haversine import haversine, Unit
+import flexpolyline as fp
+from datetime import datetime
+import math
+import logging
+from typing import Optional, List, Tuple
+
+class GPSPathPlanner:
+    """GPS-based path planning with HERE API integration"""
+    #TODO: Add HERE API key here
+    def __init__(self, serial_port='/dev/ttyUSB0', baud_rate=4800, 
+                 here_api_key="",
+                 use_mock=True):
+        self.logger = logging.getLogger("GPSPathPlanner")
+        self.diagnostic_logger = None  # Will be set by main system
+        
+        # Configuration
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.here_api_key = here_api_key
+        self.use_mock = use_mock
+        self.mock_coordinates = (55.86586456400274, -4.282926941808761)
+        
+        # State variables
+        self.current_route = []
+        self.route_index = 0
+        self.last_update_time = time.time()
+        self.current_position = None
+        self.destination = None
+        
+        # Initialize serial connection if not using mock data
+        self.serial_conn = None
+        if not use_mock:
+            try:
+                self.serial_conn = serial.Serial(serial_port, baud_rate, timeout=1)
+                self.logger.info(f"GPS serial port opened: {serial_port}")
+            except Exception as e:
+                self.logger.error(f"Failed to open GPS serial port: {e}")
+                raise
+    
+    def set_diagnostic_logger(self, diagnostic_logger):
+        """Set the diagnostic logger from the main system"""
+        self.diagnostic_logger = diagnostic_logger
+    
+    def _log_diagnostic(self, message: str, category: str = "gps"):
+        """Helper to log diagnostics if logger is available"""
+        if self.diagnostic_logger and hasattr(self.diagnostic_logger, 'log_callback'):
+            self.diagnostic_logger.log_callback(category, message)
+    
+    def nmea_to_decimal(self, degree_min: str, direction: str) -> float:
+        """Convert NMEA coordinate format to decimal degrees"""
+        try:
+            degrees = float(degree_min[:2])
+            minutes = float(degree_min[2:])
+            decimal = degrees + minutes / 60
+            if direction in ['S', 'W']:
+                decimal = -decimal
+            return decimal
+        except Exception as e:
+            self.logger.error(f"NMEA conversion error: {e}")
+            return 0.0
+
+    def extract_lat_lon(self, nmea_line: str) -> Optional[Tuple[float, float]]:
+        """Extract latitude and longitude from NMEA sentence"""
+        try:
+            if nmea_line.startswith('$GPRMC') and ',A,' in nmea_line:
+                parts = nmea_line.split(',')
+                lat = self.nmea_to_decimal(parts[3], parts[4])
+                lon = self.nmea_to_decimal(parts[5], parts[6])
+                return lat, lon
+        except Exception as e:
+            self.logger.error(f"GPS data extraction error: {e}")
+        return None
+
+    def read_gps_position(self) -> Optional[Tuple[float, float]]:
+        """Read current GPS position"""
+        timestamp = time.time()
+        
+        if self.use_mock:
+            self._log_diagnostic(f"Using mock GPS position: {self.mock_coordinates}")
+            if self.diagnostic_logger:
+                self.diagnostic_logger.add_gps_timestamp(timestamp)
+            return self.mock_coordinates
+
+        try:
+            while True:
+                if not self.serial_conn:
+                    return None
+                    
+                line = self.serial_conn.readline().decode('ascii', errors='replace').strip()
+                if line:
+                    self._log_diagnostic(f"Raw NMEA: {line}")
+                    
+                if line.startswith('$GPRMC'):
+                    if ',A,' in line:  # Valid fix
+                        pos = self.extract_lat_lon(line)
+                        if pos:
+                            self._log_diagnostic(f"Valid GPS fix: {pos}")
+                            if self.diagnostic_logger:
+                                self.diagnostic_logger.add_gps_timestamp(timestamp)
+                            return pos
+                    else:
+                        self._log_diagnostic("No valid GPS fix")
+                        
+        except Exception as e:
+            self.logger.error(f"GPS read error: {e}")
+            return None
+
+    def get_route(self, origin: Tuple[float, float], destination: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """Get route from HERE API"""
+        try:
+            self._log_diagnostic(f"Requesting route from {origin} to {destination}")
+            
+            params = {
+                "origin": f"{origin[0]},{origin[1]}",
+                "destination": f"{destination[0]},{destination[1]}",
+                "transportMode": "truck",
+                "routingMode": "fast",
+                "apiKey": self.here_api_key,
+                "return": "polyline,summary",
+                "truck.height": 4,
+                "truck.width": 2,
+                "truck.length": 18,
+                "truck.weight": 40000
+            }
+            
+            response = requests.get("https://router.hereapi.com/v8/routes", params=params)
+            
+            if response.ok:
+                data = response.json()
+                if 'routes' in data and len(data['routes']) > 0:
+                    route_data = data['routes'][0]['sections'][0]
+                    if 'polyline' in route_data:
+                        decoded_route = self._decode_polyline(route_data['polyline'])
+                        self._log_diagnostic(f"Route received with {len(decoded_route)} points")
+                        return decoded_route
+            
+            self.logger.error(f"Route request failed: {response.status_code}")
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"Route request error: {e}")
+            return []
+
+    def _decode_polyline(self, polyline: str) -> List[Tuple[float, float]]:
+        """Decode HERE API polyline format"""
+        try:
+            points = fp.decode(polyline)
+            return [(point[0], point[1]) for point in points]
+        except Exception as e:
+            self.logger.error(f"Polyline decode error: {e}")
+            return []
+
+    def check_deviation(self, current_pos: Tuple[float, float], route: List[Tuple[float, float]], threshold: float = 30) -> bool:
+        """Check if current position deviates from route"""
+        if not route:
+            return True
+            
+        min_distance = float('inf')
+        for waypoint in route:
+            distance = haversine(current_pos, waypoint, unit=Unit.METERS)
+            min_distance = min(min_distance, distance)
+            if distance <= threshold:
+                return False
+                
+        self._log_diagnostic(f"Route deviation: {min_distance:.1f}m")
+        return True
+
+    def update(self) -> Optional[dict]:
+        """Update GPS state and return navigation data"""
+        try:
+            current_pos = self.read_gps_position()
+            if not current_pos:
+                return None
+                
+            self.current_position = current_pos
+            
+            # If we have a destination but no route, get initial route
+            if self.destination and not self.current_route:
+                self.current_route = self.get_route(current_pos, self.destination)
+                
+            # Check for deviation if we have a route
+            if self.current_route:
+                if self.check_deviation(current_pos, self.current_route):
+                    self._log_diagnostic("Recalculating route due to deviation")
+                    self.current_route = self.get_route(current_pos, self.destination)
+            
+            # Return navigation state
+            return {
+                "position": current_pos,
+                "route": self.current_route,
+                "destination": self.destination,
+                "timestamp": time.time()
+            }
+            
+        except Exception as e:
+            self.logger.error(f"GPS update error: {e}")
+            return None
+
+    def set_destination(self, lat: float, lon: float):
+        """Set new destination and trigger route calculation"""
+        self.destination = (lat, lon)
+        if self.current_position:
+            self.current_route = self.get_route(self.current_position, self.destination)
+
+    def cleanup(self):
+        """Clean up resources"""
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+            self.logger.info("GPS serial port closed")
